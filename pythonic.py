@@ -1,5 +1,6 @@
 from pyvx import vx
 from pyvx.backend import lib, ffi
+import array
 import logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -85,6 +86,24 @@ class Data_type(object):
     VX_TYPE_META_FORMAT = vx.TYPE_META_FORMAT
     VX_TYPE_OBJECT_MAX = vx.TYPE_OBJECT_MAX
 
+class Policy(object):
+    VX_CONVERT_POLICY_WRAP = vx.CONVERT_POLICY_WRAP
+    VX_CONVERT_POLICY_SATURATE = vx.CONVERT_POLICY_SATURATE
+    VX_ROUND_POLICY_TO_ZERO = vx.ROUND_POLICY_TO_ZERO
+    VX_ROUND_POLICY_TO_NEAREST_EVEN = vx.ROUND_POLICY_TO_NEAREST_EVEN
+
+class Interpolation(object):
+    VX_INTERPOLATION_TYPE_NEAREST_NEIGHBOR = vx.INTERPOLATION_TYPE_NEAREST_NEIGHBOR
+    VX_INTERPOLATION_TYPE_BILINEAR = vx.INTERPOLATION_TYPE_BILINEAR
+    VX_INTERPOLATION_TYPE_AREA = vx.INTERPOLATION_TYPE_AREA
+
+class Scale(object):
+    SCALE_PYRAMID_HALF = vx.SCALE_PYRAMID_HALF
+    SCALE_PYRAMID_ORB = vx.SCALE_PYRAMID_ORB
+
+class Norm(object):
+    NORM_L1 = vx.NORM_L1
+    NORM_L2 = vx.NORM_L2
 
 class Reference(object):
     def __init__(self):
@@ -163,7 +182,7 @@ class Graph(Reference):
         else:
             self.graph = vx.CreateGraph(ctx.vx_context)
             self.vx_ref = vx.reference(self.graph)
-                self.context = ctx
+            self.context = ctx
             self.vx_context = ctx.get_context()
 
     def __enter__(self):
@@ -311,12 +330,112 @@ class Threshold(Reference):
 class Scalar(Reference):
 
     def __init__(self, context, data_type, value):
-        self._scalar = vx.CreateScalar(context, data_type, value)
+        self._scalar = vx.CreateScalar(context.vx_context, data_type, value)
         self._value = value
         self._type = data_type
 
     def get_value(self):
         return self._value
+
+
+class Lut(Reference):
+    def __init__(self, context, data_type, count):
+        self._lut = vx.CreateLUT(context.vx_context, data_type, count)
+        self.data_typr = data_type
+        self.count = count
+        self.values = []
+
+    def get_lut(self):
+        return self.values
+
+    def set_values(self, values):
+        self.values = values
+        status, ptr = vx.AccessLUT(self._lut, None, vx.READ_AND_WRITE)
+        if status:
+            raise NameError('Failed to accessLUT')
+        for v, i in zip(values, range(len(ptr))):
+            ptr[i] = v
+        vx.CommitLUT(self._lut, ptr)
+
+
+class Convolution(Reference):
+    def __init__(self, context, columns, rows):
+        self._convolution = vx.CreateConvolution(context.vx_context, columns=columns, rows=rows)
+        self.array = None
+    def get_convolution(self):
+        return vx.ReadConvolutionCoefficients(self._convolution, self.array)
+
+    def set_convolution(self, array):
+        """
+        needs to be fix!
+        :param array:
+        :return:
+        """
+        return vx.WriteConvolutionCoefficients(self._convolution, array)
+
+
+class Matrix(Reference):
+    def __init__(self, data_type, context, columns, rows):
+        self.columns= columns
+        self.rows = rows
+        self.data_type = data_type
+        self.data = None
+        self._matrix = vx.CreateMatrix(context.vx_context, data_type, columns, rows)
+
+    def set_array(self):
+        if self.data_type is Data_type.VX_TYPE_FLOAT32:
+            self.data = array.array('f')
+        else:
+            self.data = array.array('l')
+        for i in range(0, self.columns*self.rows):
+            self.data.append(-1)
+
+    def get_matrix(self):
+        vx.ReadMatrix(self._matrix, self.data)
+        return self.data
+
+    def set_matrix(self, matrix_values):
+        for val, i in zip(matrix_values, range(0, len(matrix_values))):
+            self.data[i] = val
+        vx.WriteMatrix(self._matrix, self.data)
+
+
+class Pyramid(Reference):
+    def __init__(self, context_graph, levels, scale, width, height, image_format, virtual=False):
+        self.levels = levels
+        self.scale = scale
+        self.width = width
+        self.height = height
+        self.format = image_format
+        if virtual:
+            self._pyramid = vx.CreateVirtualPyramid(context_graph.vx_context, levels, scale, width, height, image_format)
+        else:
+            self._pyramid = vx.CreatePyramid(context_graph.graph, levels, scale, width, height, image_format)
+
+
+class Array(Reference):
+    def __init__(self, context, item_type, capacity):
+        self.item_type = item_type
+        self.capacity = capacity
+        self._array = vx.CreateArray(context.vx_context, item_type, capacity)
+
+    def get_array(self):
+        pass
+
+    def add_item(self, count, elements, stride=0):
+        items = array.array('l')
+        for i in elements:
+            items.append(i)
+        print vx.AddArrayItems(self._array, count, items, stride)
+
+
+class Remap(Reference):
+    def __init__(self, context, src_width, src_height, dst_width, dst_height):
+        self.src_width = src_width
+        self.src_height =src_height
+        self.dst_width = dst_width
+        self.dst_height = dst_height
+        self._remap = vx.CreateRemap(context.vx_context, src_width, src_height, dst_width, dst_height)
 
 
 def Sobel3x3Node(graph, input_img, output_x=None, output_y=None):
@@ -413,6 +532,13 @@ def XorNode(graph, src1, src2, output=None):
     return output
 
 
+def OrNode(graph, src1, src2, output=None):
+    if output is None:
+        output = Image(graph, src1.get_width(), src2.get_height(), Color.VX_DF_IMAGE_U8)
+    vx.OrNode(graph.graph, src1.image, src2.image, output.image)
+    return output
+
+
 def ChannelCombineNode(graph, plane1, plane2, plane3=None, plane4=None, output=None, color=None):
     if output is None:
         if color is None:
@@ -455,4 +581,187 @@ def ConvertDepthNode(graph, src_img, policy, output=None, color=None, scalar=Non
         scalar = Scalar(graph.vx_context, Data_type.VX_TYPE_INT32, 0)
     vx.ConvertDepthNode(graph.graph, src_img.image, output.image, policy, scalar._scalar)
     return output
-# CannyEdgeDetectorNode
+
+
+def AccumulateSquareImageNode(graph, src_img, alpha, accum=None):
+    if accum is None:
+        accum = Image(graph, src_img.get_width(), src_img.get_height(), Color.VX_DF_IMAGE_S16)
+    vx.AccumulateSquareImageNode(graph.graph, src_img.image, alpha._scalar, accum.image)
+    return accum
+
+
+def AccumulateWeightedImageNode(graph, src_img, alpha, accum=None):
+    if accum is None:
+        accum = Image(graph, src_img.get_width(), src_img.get_height(), Color.VX_DF_IMAGE_U8)
+    vx.AccumulateWeightedImageNode(graph.graph, src_img.image, alpha._scalar, accum.image)
+    return accum
+
+
+def AddNode(graph, src_img, src_img2, policy, output):
+    if output is None:
+        if src_img.get_color() is 'DF_IMAGE_U8' and src_img2.get_color() is 'DF_IMAGE_U8':
+            output = Image(graph, src_img.get_width(), src_img.get_height(), Color.VX_DF_IMAGE_U8)
+        else:
+            output = Image(graph, src_img.get_width(), src_img.get_height(), Color.VX_DF_IMAGE_S16)
+    vx.AddNode(graph.graph, src_img.image, src_img2.image, policy, output.image)
+    return output
+
+
+def SubtractNode(graph, src_img, src_img2, policy, output):
+    if output is None:
+        if src_img.get_color() is 'DF_IMAGE_U8' and src_img2.get_color() is 'DF_IMAGE_U8':
+            output = Image(graph, src_img.get_width(), src_img.get_height(), Color.VX_DF_IMAGE_U8)
+        else:
+            output = Image(graph, src_img.get_width(), src_img.get_height(), Color.VX_DF_IMAGE_S16)
+    vx.SubtractNode(graph.graph, src_img.image, src_img2.image, policy, output.image)
+    return output
+
+
+def Dilate3x3Node(graph, src_img, output = None):
+    if output is None:
+        output = Image(graph, src_img.get_width(), src_img.get_height(), Color.VX_DF_IMAGE_U8)
+    vx.Dilate3x3Node(graph.graph, src_img.image, output.image)
+    return output
+
+
+def Erode3x3Node(graph, src_img, output = None):
+    if output is None:
+        output = Image(graph, src_img.get_width(), src_img.get_height(), Color.VX_DF_IMAGE_U8)
+    vx.Erode3x3Node(graph.graph, src_img.image, output.image)
+    return output
+
+
+def Median3x3Node(graph, src_img, output = None):
+    if output is None:
+        output = Image(graph, src_img.get_width(), src_img.get_height(), Color.VX_DF_IMAGE_U8)
+    vx.Median3x3Node(graph.graph, src_img.image, output.image)
+    return output
+
+
+def MeanStdDevNode(graph, src_img, mean, stddev):
+    if mean is None:
+        mean = Scalar(graph.vx_context, Data_type.VX_TYPE_FLOAT32, 0)
+    if stddev is None:
+        stddev = Scalar(graph.vx_context, Data_type.VX_TYPE_FLOAT32, 0)
+    vx.MeanStdDevNode(graph.graph, src_img.image, mean._scalar, stddev._scalar)
+    return mean, stddev
+
+
+def TableLookupNode(graph, src_img, lut, output = None):
+    if output is None:
+        output = Image(graph, src_img.get_width(), src_img.get_height(), Color.VX_DF_IMAGE_U8)
+    vx.TableLookupNode(graph.graph, src_img.image, lut._lut, output.image)
+    return output
+
+
+def ConvolveNode(graph, src_img, conv, output = None):
+    if output is None:
+        output = Image(graph, src_img.get_width(), src_img.get_height(), Color.VX_DF_IMAGE_S16)
+    vx.ConvolveNode(graph.graph, src_img.image, conv._convolution, output.image)
+    return output
+
+
+def HalfScaleGaussianNode(graph, src_img, output = None, kernel_size=3):
+    if output is None:
+        output = Image(graph, src_img.get_width(), src_img.get_height(), Color.VX_DF_IMAGE_U8)
+    vx.HalfScaleGaussianNode(graph.graph, src_img.image, output.image, kernel_size)
+    return output
+
+
+def ScaleImageNode(graph, src_img, output = None, interpolation=Interpolation.VX_INTERPOLATION_TYPE_NEAREST_NEIGHBOR):
+    if output is None:
+        output = Image(graph, src_img.get_width(), src_img.get_height())
+    vx.ScaleImageNode(graph.graph, src_img.image, output.image, interpolation)
+    return output
+
+
+def WarpAffineNode(graph, src_img, matrix, interpolation, output = None):
+    if output is None:
+        output = Image(graph, src_img.get_width(), src_img.get_height(), Color.VX_DF_IMAGE_U8)
+    vx.WarpAffineNode(graph.graph, src_img.image, matrix._matrix, interpolation, output.image)
+    return output
+
+
+def WarpPerspectiveNode(graph, src_img, matrix, interpolation, output = None):
+    if output is None:
+        output = Image(graph, src_img.get_width(), src_img.get_height(), Color.VX_DF_IMAGE_U8)
+    vx.WarpPerspectiveNode(graph.graph, src_img.image, matrix._matrix, interpolation, output.image)
+    return output
+
+
+def MultiplyNode(graph, src_img1, src_img2, scale, overflow_policy, rounding_policy, output = None):
+    if output is None:
+        if src_img1.get_color() is 'DF_IMAGE_U8' and src_img2.get_color() is 'DF_IMAGE_U8':
+            output = Image(graph, src_img1.get_width(), src_img1.get_height(), Color.VX_DF_IMAGE_U8)
+        else:
+            output = Image(graph, src_img1.get_width(), src_img1.get_height(), Color.VX_DF_IMAGE_S16)
+    vx.MultiplyNode(graph.graph, src_img1.image, scale._scalar, overflow_policy, rounding_policy, output.image)
+    return output
+
+
+def GaussianPyramidNode(graph, src_img, gaussian):
+    vx.GaussianPyramidNode(graph.graph, src_img.image, gaussian)
+    return gaussian
+
+
+def IntegralImageNode(graph, src, output=None):
+    if output is None:
+        output = Image(graph, src.get_width(), src.get_height(), Color.VX_DF_IMAGE_U32)
+    vx.IntegralImageNode(graph.graph, src.image, output.image)
+    return output
+
+
+def CannyEdgeDetectorNode(graph, src_img, hyst, gradient_size, norm_type, output = None):
+    if output is None:
+        output = Image(graph, src_img.get_width(), src_img.get_height(), Color.VX_DF_IMAGE_U8)
+    vx.CannyEdgeDetectorNode(graph.graph, src_img.image, hyst.threshold, gradient_size, norm_type, output.image)
+    return output
+
+
+def FastCornersNode(graph, src_img, threshold, nonmax_suppression, num_of_corners_to_detect, corners=None, num_corners=None):
+    if corners is None:
+        corners = Array(graph.vx_context, Data_type.VX_TYPE_KEYPOINT, num_of_corners_to_detect)
+    if num_corners is None:
+        num_corners = Scalar(graph.vx_context, Data_type.VX_TYPE_SIZE)
+    vx.FastCornersNode(graph.graph, src_img.image, threshold._scalar, nonmax_suppression, corners._array, num_corners._scalar)
+    return corners, num_corners
+
+
+def HarrisCornersNode(graph, src_img, threshold, min_distance, sensitivity, gradient_size, block_size, num_of_corners_to_detect, corners=None, num_corners=None):
+    if corners is None:
+        corners = Array(graph.vx_context, Data_type.VX_TYPE_KEYPOINT, num_of_corners_to_detect)
+    if num_corners is None:
+        num_corners = Scalar(graph.vx_context, Data_type.VX_TYPE_SIZE)
+    vx.HarrisCornersNode(graph.graph, src_img.image, threshold._scalar, min_distance._scalar, sensitivity._scalar, gradient_size, block_size, corners._array, num_corners._scalar)
+    return corners, num_corners
+
+
+def MinMaxLocNode(graph, src_img, min_val=None, max_val=None, min_loc=None, max_loc=None, min_count=None, max_count=None):
+    if min_val is None:
+        min_val = Scalar(graph.vx_context, Data_type.VX_TYPE_INT16)
+    if max_val is None:
+        max_val = Scalar(graph.vx_context, Data_type.VX_TYPE_INT16)
+    if min_loc is None:
+        min_loc = Array(graph.vx_context, Data_type.VX_TYPE_COORDINATES2D, 100)
+    if max_loc is None:
+        max_loc = Array(graph.vx_context, Data_type.VX_TYPE_COORDINATES2D, 100)
+    if min_count is None:
+        min_count = Scalar(graph.vx_context, Data_type.VX_TYPE_UINT32)
+    if max_count is None:
+        max_count = Scalar(graph.vx_context, Data_type.VX_TYPE_UINT32)
+    vx.MinMaxLocNode(graph.graph, src_img.image, min_val._scalar, max_val._scalar, min_loc._array, max_loc._array, min_count._scalar, max_count._scalar)
+
+
+def OpticalFlowPyrLKNode(graph, old_images, new_images, old_points, new_points_estimates, new_points, termination,epsilon, num_iterations, use_initial_estimate, window_dimension):
+    vx.OpticalFlowPyrLKNode(graph.graph, old_images._pyramid, new_images._pyramid, old_points._array, new_points_estimates._array, new_points._array, termination,
+epsilon._scalar, num_iterations._scalar, use_initial_estimate._scalar, window_dimension)
+
+
+def RemapNode(graph, src1, src2, table, policy, output=None):
+    if output is None:
+        output = Image(graph, src1.get_width(), src1.get_height(), Color.VX_DF_IMAGE_U8)
+    vx.RemapNode(graph.graph, src1.image, src2.image,table._remap, policy, output.image)
+    return output
+
+
+
